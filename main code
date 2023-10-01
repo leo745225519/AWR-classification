@@ -1,0 +1,874 @@
+library(tidymodels)
+library(stacks)
+
+# 读取数据
+data1 <- readxl::read_excel("建模用.xlsx")
+colnames(data1)
+
+# 修正变量类型
+# 将分类变量转换为factor
+for(i in c(2,3,5:19)){
+  data1[[i]] <- factor(data1[[i]])
+}
+# 变量类型修正后数据概况
+skimr::skim(data1)
+
+################################################################
+
+# 数据拆分
+set.seed(1227)
+datasplit <- 
+  initial_split(data1, prop = 0.8, strata = 病理分型)
+traindata <- training(datasplit)
+testdata <- testing(datasplit)
+
+
+alldata <- data1
+alldata$set <- "test"
+alldata$set[datasplit$in_id] <- "train"
+################################################################
+
+# 数据预处理
+# 先对照训练集写配方
+datarecipe <- recipe(病理分型 ~ ., traindata) %>%
+  step_rm(编号) %>%
+  step_dummy(all_nominal_predictors()) %>%
+  # step_range(all_predictors()) %>%
+  step_center(all_predictors()) %>%
+  step_scale(all_predictors()) %>%
+  prep()
+datarecipe
+
+# 按方处理训练集和测试集
+traindata2 <- bake(datarecipe, new_data = NULL)
+testdata2 <- bake(datarecipe, new_data = testdata)
+alldata2 <- bake(datarecipe, new_data = alldata)
+
+# 数据预处理后数据概况
+skimr::skim(traindata2)
+skimr::skim(testdata2)
+
+
+# 设定xx折交叉验证
+set.seed(1227)
+folds <- vfold_cv(traindata2, v = xx)
+folds
+
+###############################################################
+###############################################################
+###############################################################
+
+# 训练LASSO模型
+# 设定模型
+model_lasso <- multinom_reg(
+  mode = "classification",
+  engine = "glmnet",
+  mixture = 1,  # LASSO
+  penalty = tune()
+)
+model_lasso
+
+# workflow
+wk_lasso <- workflow() %>%
+  add_model(model_lasso) %>%
+  add_formula(病理分型 ~ .)
+wk_lasso
+
+# 超参数寻优范围
+hpset_lasso <- parameters(penalty(range = c(-5, 0)))
+hpgrid_lasso <- grid_regular(hpset_lasso, levels = 20)
+hpgrid_lasso
+
+# 交叉验证网格搜索过程
+set.seed(1227)
+tune_lasso <- wk_lasso %>%
+  tune_grid(resamples = folds,
+            grid = hpgrid_lasso,
+            metrics = metric_set(accuracy, roc_auc, pr_auc),
+            control = control_grid(verbose = T, save_pred = T))
+
+# 图示交叉验证结果
+autoplot(tune_lasso)
+eval_tune_lasso <- tune_lasso %>%
+  collect_metrics()
+eval_tune_lasso
+
+# 经过交叉验证得到的最优超参数
+hpbest_lasso <- tune_lasso %>%
+  select_by_one_std_err(metric = "accuracy", desc(penalty))
+hpbest_lasso
+
+# 采用最优超参数组合训练最终模型
+set.seed(1227)
+final_lasso <- wk_lasso %>%
+  finalize_workflow(hpbest_lasso) %>%
+  fit(traindata2)
+final_lasso
+
+
+# lasso筛选得到的变量
+coef_lasso <- final_lasso %>% 
+  tidy() %>%
+  filter(estimate != 0, term != "(Intercept)") %>%
+  pull(term) %>%
+  unique()
+coef_lasso
+
+newformula <-
+  as.formula(paste("病理分型 ~",
+                   paste(coef_lasso, collapse = " + ")))
+newformula
+
+# # 提取最终的算法模型
+# final_lasso %>%
+#   extract_fit_engine() %>%
+#   plot()
+
+#########################################################
+
+# 应用模型-预测所有样本
+predall_lasso <- final_lasso %>%
+  predict(new_data = alldata2, type = "prob") %>%
+  bind_cols(final_lasso %>%
+              predict(new_data = alldata2, type = "class")) %>%
+  bind_cols(alldata) %>%
+  mutate(model = "lasso")
+
+#########################################################
+
+# 应用模型-预测训练集
+predtrain_lasso <- final_lasso %>%
+  predict(new_data = traindata2, type = "prob") %>%
+  bind_cols(final_lasso %>%
+              predict(new_data = traindata2, type = "class")) %>%
+  bind_cols(traindata2 %>% select(病理分型)) %>%
+  mutate(dataset = "train")
+
+# 评估模型ROC曲线-训练集上
+roctrain_lasso <- predtrain_lasso %>%
+  roc_curve(病理分型, 1:3) %>%
+  mutate(dataset = "train")
+autoplot(roctrain_lasso)
+
+# 混淆矩阵
+cmtrain_lasso <- predtrain_lasso %>%
+  conf_mat(truth = 病理分型, estimate = .pred_class)
+cmtrain_lasso
+autoplot(cmtrain_lasso, type = "heatmap") +
+  scale_fill_gradient(low = "white", high = "skyblue") +
+  labs(title = "confusionmatrix of lasso for traindata") +
+  theme(text = element_text(size = 15))
+# 合并指标
+eval_train_lasso <- cmtrain_lasso %>%
+  summary() %>%
+  bind_rows(predtrain_lasso %>%
+              roc_auc(病理分型, 1:3)) %>%
+  mutate(dataset = "train")
+eval_train_lasso
+
+########################################################
+
+# 应用模型-预测测试集
+predtest_lasso <- final_lasso %>%
+  predict(new_data = testdata2, type = "prob") %>%
+  bind_cols(final_lasso %>%
+              predict(new_data = testdata2, type = "class")) %>%
+  bind_cols(testdata2 %>% select(病理分型)) %>%
+  mutate(dataset = "test") %>%
+  mutate(model = "lasso")
+
+# 评估模型ROC曲线-测试集上
+roctest_lasso <- predtest_lasso %>%
+  roc_curve(病理分型, 1:3) %>%
+  mutate(dataset = "test")
+autoplot(roctest_lasso)
+
+
+# 混淆矩阵
+cmtest_lasso <- predtest_lasso %>%
+  conf_mat(truth = 病理分型, estimate = .pred_class)
+cmtest_lasso
+autoplot(cmtest_lasso, type = "heatmap") +
+  scale_fill_gradient(low = "white", high = "skyblue") +
+  labs(title = "confusionmatrix of lasso for testdata") +
+  theme(text = element_text(size = 15))
+# 合并指标
+eval_test_lasso <- cmtest_lasso %>%
+  summary() %>%
+  bind_rows(predtest_lasso %>%
+              roc_auc(病理分型, 1:3)) %>%
+  mutate(dataset = "test")
+eval_test_lasso
+
+##########################################################
+
+# 合并训练集和测试集上ROC曲线
+roctrain_lasso %>%
+  bind_rows(roctest_lasso) %>%
+  mutate(dataset = factor(dataset, levels = c("train", "test"))) %>%
+  ggplot(aes(x = 1-specificity, y = sensitivity, color = dataset)) +
+  geom_path(size = 1) +
+  geom_abline(intercept = 0, slope = 1) +
+  facet_wrap(~.level) +
+  labs(title = "ROC of lasso") +
+  theme_bw()
+
+# 合并训练集和测试集上性能指标
+eval_lasso <- eval_train_lasso %>%
+  bind_rows(eval_test_lasso) %>%
+  mutate(model = "lasso")
+eval_lasso
+
+##########################################################
+##########################################################
+##########################################################
+
+# 训练随机森林模型
+# 设定模型
+model_rf <- rand_forest(
+  mode = "classification",
+  engine = "randomForest",
+  mtry = tune(),
+  trees = tune(),
+  min_n = tune()
+) %>%
+  set_args(importance = T)
+model_rf
+
+# workflow
+wk_rf <- 
+  workflow() %>%
+  add_model(model_rf) %>%
+  add_formula(newformula)
+wk_rf
+
+# 超参数寻优范围
+hpset_rf <- parameters(
+  mtry(range = c(2, 10)), 
+  trees(range = c(300, 500)),
+  min_n(range = c(10, 20))
+)
+hpgrid_rf <- grid_regular(hpset_rf, levels = c(4, 3, 3))
+hpgrid_rf
+
+
+# 交叉验证网格搜索过程
+set.seed(1227)
+tune_rf <- wk_rf %>%
+  tune_grid(resamples = folds,
+            grid = hpgrid_rf,
+            metrics = metric_set(accuracy, roc_auc, pr_auc),
+            control = control_grid(verbose = T, save_pred = T))
+
+# 图示交叉验证结果
+autoplot(tune_rf)
+eval_tune_rf <- tune_rf %>%
+  collect_metrics()
+eval_tune_rf
+
+# 经过交叉验证得到的最优超参数
+hpbest_rf <- tune_rf %>%
+  select_best(metric = "accuracy")
+hpbest_rf
+
+# 采用最优超参数组合训练最终模型
+set.seed(1227)
+final_rf <- wk_rf %>%
+  finalize_workflow(hpbest_rf) %>%
+  fit(traindata2)
+final_rf
+
+# 提取最终的算法模型
+final_rf2 <- final_rf %>%
+  extract_fit_engine()
+final_rf2
+# 
+# plot(final_rf2, main = "随机森林树的棵树与误差演变", ylim = c(0, 1))
+# legend("top", 
+#        legend = colnames(final_rf2$err.rate),
+#        lty = 1:4,
+#        col = 1:4,
+#        horiz = T)
+# 
+# 变量重要性
+importance(final_rf2)
+varImpPlot(final_rf2, main = "变量重要性")
+as.data.frame(importance(final_rf2)) %>%
+  rownames_to_column("x") %>%
+  readr::write_excel_csv("随机森林变量重要性.csv")
+
+#################################################################
+
+# 应用模型-预测所有样本
+predall_rf <- final_rf %>%
+  predict(new_data = alldata2, type = "prob") %>%
+  bind_cols(final_rf %>%
+              predict(new_data = alldata2, type = "class")) %>%
+  bind_cols(alldata) %>%
+  mutate(model = "rf")
+
+#################################################################
+
+# 应用模型-预测训练集
+predtrain_rf <- final_rf %>%
+  predict(new_data = traindata2, type = "prob") %>%
+  bind_cols(final_rf %>%
+              predict(new_data = traindata2, type = "class")) %>%
+  bind_cols(traindata2 %>% select(病理分型)) %>%
+  mutate(dataset = "train")
+
+# 评估模型ROC曲线-训练集上
+roctrain_rf <- predtrain_rf %>%
+  roc_curve(病理分型, 1:3) %>%
+  mutate(dataset = "train")
+autoplot(roctrain_rf)
+
+# 混淆矩阵
+cmtrain_rf <- predtrain_rf %>%
+  conf_mat(truth = 病理分型, estimate = .pred_class)
+cmtrain_rf
+autoplot(cmtrain_rf, type = "heatmap") +
+  scale_fill_gradient(low = "white", high = "skyblue") +
+  labs(title = "confusionmatrix of rf for traindata") +
+  theme(text = element_text(size = 15))
+# 合并指标
+eval_train_rf <- cmtrain_rf %>%
+  summary() %>%
+  bind_rows(predtrain_rf %>%
+              roc_auc(病理分型, 1:3)) %>%
+  mutate(dataset = "train")
+eval_train_rf
+#################################################################
+
+# 应用模型-预测测试集
+predtest_rf <- final_rf %>%
+  predict(new_data = testdata2, type = "prob") %>%
+  bind_cols(final_rf %>%
+              predict(new_data = testdata2, type = "class")) %>%
+  bind_cols(testdata2 %>% select(病理分型)) %>%
+  mutate(dataset = "test") %>%
+  mutate(model = "rf")
+
+# 评估模型ROC曲线-测试集上
+roctest_rf <- predtest_rf %>%
+  roc_curve(病理分型, 1:3) %>%
+  mutate(dataset = "test")
+autoplot(roctest_rf)
+
+
+# 混淆矩阵
+cmtest_rf <- predtest_rf %>%
+  conf_mat(truth = 病理分型, estimate = .pred_class)
+cmtest_rf
+autoplot(cmtest_rf, type = "heatmap") +
+  scale_fill_gradient(low = "white", high = "skyblue") +
+  labs(title = "confusionmatrix of rf for testdata") +
+  theme(text = element_text(size = 15))
+# 合并指标
+eval_test_rf <- cmtest_rf %>%
+  summary() %>%
+  bind_rows(predtest_rf %>%
+              roc_auc(病理分型, 1:3)) %>%
+  mutate(dataset = "test")
+eval_test_rf
+#################################################################
+
+# 合并训练集和测试集上ROC曲线
+roctrain_rf %>%
+  bind_rows(roctest_rf) %>%
+  mutate(dataset = factor(dataset, levels = c("train", "test"))) %>%
+  ggplot(aes(x = 1-specificity, y = sensitivity, color = dataset)) +
+  geom_path(size = 1) +
+  geom_abline(intercept = 0, slope = 1) +
+  facet_wrap(~.level) +
+  labs(title = "ROC of rf") +
+  theme_bw()
+
+
+# 合并训练集和测试集上性能指标
+eval_rf <- eval_train_rf %>%
+  bind_rows(eval_test_rf) %>%
+  mutate(model = "rf")
+eval_rf
+
+#############################################################
+#############################################################
+#############################################################
+
+# 训练xgboost模型
+# 设定模型
+model_xgboost <- boost_tree(
+  mode = "classification",
+  engine = "xgboost",
+  mtry = tune(),
+  trees = 1000,
+  min_n = tune(),
+  tree_depth = tune(),
+  learn_rate = tune(),
+  loss_reduction = tune(),
+  sample_size = tune(),
+  stop_iter = 5
+) %>%
+  set_args(validation = 0.2)
+model_xgboost
+
+# workflow
+wk_xgboost <- 
+  workflow() %>%
+  add_model(model_xgboost) %>%
+  add_formula(newformula)
+wk_xgboost
+
+# 超参数寻优范围
+hpset_xgboost <- parameters(
+  mtry(range = c(2, 8)),
+  min_n(range = c(5, 20)),
+  tree_depth(range = c(1, 3)),
+  learn_rate(range = c(-3, -1)),
+  loss_reduction(range = c(-3, 0)),
+  sample_prop(range = c(0.8, 1))
+)
+set.seed(1227)
+hpgrid_xgboost <- grid_random(hpset_xgboost, size = 25)
+hpgrid_xgboost
+
+
+# 交叉验证随机搜索过程
+set.seed(1227)
+tune_xgboost <- wk_xgboost %>%
+  tune_grid(resamples = folds,
+            grid = hpgrid_xgboost,
+            metrics = metric_set(accuracy, roc_auc, pr_auc),
+            control = control_grid(verbose = T, save_pred = T))
+
+# 图示交叉验证结果
+autoplot(tune_xgboost)
+eval_tune_xgboost <- tune_xgboost %>%
+  collect_metrics()
+eval_tune_xgboost
+
+# 经过交叉验证得到的最优超参数
+hpbest_xgboost <- tune_xgboost %>%
+  select_best(metric = "accuracy")
+hpbest_xgboost
+
+# 采用最优超参数组合训练最终模型
+set.seed(1227)
+final_xgboost <- wk_xgboost %>%
+  finalize_workflow(hpbest_xgboost) %>%
+  fit(traindata2)
+final_xgboost
+
+# # 提取最终的算法模型
+# final_xgboost2 <- final_xgboost %>%
+#   extract_fit_engine()
+# 
+# importance_matrix <- xgb.importance(model = final_xgboost2)
+# print(importance_matrix)
+# xgb.plot.importance(importance_matrix = importance_matrix,
+#                     measure = "Cover",
+#                     col = "skyblue")
+
+
+#################################################################
+
+# 应用模型-预测所有样本
+predall_xgboost <- final_xgboost %>%
+  predict(new_data = alldata2, type = "prob") %>%
+  bind_cols(final_xgboost %>%
+              predict(new_data = alldata2, type = "class")) %>%
+  bind_cols(alldata) %>%
+  mutate(model = "xgboost")
+
+#################################################################
+
+# 应用模型-预测训练集
+predtrain_xgboost <- final_xgboost %>%
+  predict(new_data = traindata2, type = "prob") %>%
+  bind_cols(final_xgboost %>%
+              predict(new_data = traindata2, type = "class")) %>%
+  bind_cols(traindata2 %>% select(病理分型)) %>%
+  mutate(dataset = "train")
+
+# 评估模型ROC曲线-训练集上
+roctrain_xgboost <- predtrain_xgboost %>%
+  roc_curve(病理分型, 1:3) %>%
+  mutate(dataset = "train")
+autoplot(roctrain_xgboost)
+
+# 混淆矩阵
+cmtrain_xgboost <- predtrain_xgboost %>%
+  conf_mat(truth = 病理分型, estimate = .pred_class)
+cmtrain_xgboost
+autoplot(cmtrain_xgboost, type = "heatmap") +
+  scale_fill_gradient(low = "white", high = "skyblue") +
+  labs(title = "confusionmatrix of xgboost for traindata") +
+  theme(text = element_text(size = 15))
+# 合并指标
+eval_train_xgboost <- cmtrain_xgboost %>%
+  summary() %>%
+  bind_rows(predtrain_xgboost %>%
+              roc_auc(病理分型, 1:3)) %>%
+  mutate(dataset = "train")
+eval_train_xgboost
+#################################################################
+
+# 应用模型-预测测试集
+predtest_xgboost <- final_xgboost %>%
+  predict(new_data = testdata2, type = "prob") %>%
+  bind_cols(final_xgboost %>%
+              predict(new_data = testdata2, type = "class")) %>%
+  bind_cols(testdata2 %>% select(病理分型)) %>%
+  mutate(dataset = "test") %>%
+  mutate(model = "xgboost")
+
+# 评估模型ROC曲线-测试集上
+roctest_xgboost <- predtest_xgboost %>%
+  roc_curve(病理分型, 1:3) %>%
+  mutate(dataset = "test")
+autoplot(roctest_xgboost)
+
+
+# 混淆矩阵
+cmtest_xgboost <- predtest_xgboost %>%
+  conf_mat(truth = 病理分型, estimate = .pred_class)
+cmtest_xgboost
+autoplot(cmtest_xgboost, type = "heatmap") +
+  scale_fill_gradient(low = "white", high = "skyblue") +
+  labs(title = "confusionmatrix of xgboost for testdata") +
+  theme(text = element_text(size = 15))
+# 合并指标
+eval_test_xgboost <- cmtest_xgboost %>%
+  summary() %>%
+  bind_rows(predtest_xgboost %>%
+              roc_auc(病理分型, 1:3)) %>%
+  mutate(dataset = "test")
+eval_test_xgboost
+#################################################################
+
+# 合并训练集和测试集上ROC曲线
+roctrain_xgboost %>%
+  bind_rows(roctest_xgboost) %>%
+  mutate(dataset = factor(dataset, levels = c("train", "test"))) %>%
+  ggplot(aes(x = 1-specificity, y = sensitivity, color = dataset)) +
+  geom_path(size = 1) +
+  geom_abline(intercept = 0, slope = 1) +
+  facet_wrap(~.level) +
+  labs(title = "ROC of xgboost") +
+  theme_bw()
+
+
+# 合并训练集和测试集上性能指标
+eval_xgboost <- eval_train_xgboost %>%
+  bind_rows(eval_test_xgboost) %>%
+  mutate(model = "xgboost")
+eval_xgboost
+
+
+#################################################################
+#################################################################
+#################################################################
+
+# 训练高斯核支持向量机模型
+# 设定模型
+model_rsvm <- svm_rbf(
+  mode = "classification",
+  engine = "kernlab",
+  cost = tune(),
+  rbf_sigma = tune()
+)
+model_rsvm
+
+# workflow
+wk_rsvm <- 
+  workflow() %>%
+  add_model(model_rsvm) %>%
+  add_formula(newformula)
+wk_rsvm
+
+
+
+# 超参数寻优范围
+hpset_rsvm <- parameters(cost(range = c(-5, 5)), 
+                         rbf_sigma(range = c(-4, 0)))
+hpgrid_rsvm <- grid_regular(hpset_rsvm, levels = c(5, 4))
+
+
+# 交叉验证网格搜索过程
+set.seed(1227)
+tune_rsvm <- wk_rsvm %>%
+  tune_grid(resamples = folds,
+            grid = hpgrid_rsvm,
+            metrics = metric_set(accuracy, roc_auc, pr_auc),
+            control = control_grid(verbose = T, save_pred = T))
+
+# 图示交叉验证结果
+autoplot(tune_rsvm)
+eval_tune_rsvm <- tune_rsvm %>%
+  collect_metrics()
+eval_tune_rsvm
+
+
+# 经过交叉验证得到的最优超参数
+hpbest_rsvm <- tune_rsvm %>%
+  select_best(metric = "accuracy")
+hpbest_rsvm
+
+# 采用最优超参数组合训练最终模型
+final_rsvm <- wk_rsvm %>%
+  finalize_workflow(hpbest_rsvm) %>%
+  fit(traindata2)
+final_rsvm
+
+# # 提取最终的算法模型
+# final_rsvm %>%
+#   extract_fit_engine()
+
+#################################################################
+
+# 应用模型-预测所有样本
+predall_rsvm <- final_rsvm %>%
+  predict(new_data = alldata2, type = "prob")
+predall_rsvm$.pred_class <- factor(
+  levels(alldata2$病理分型)[apply(predall_rsvm[, 1:3], 1, which.max)]
+)
+predall_rsvm <- predall_rsvm %>%
+  bind_cols(alldata) %>%
+  mutate(model = "svm")
+
+#################################################################
+
+# 应用模型-预测训练集
+predtrain_rsvm <- final_rsvm %>%
+  predict(new_data = traindata2, type = "prob")
+predtrain_rsvm$.pred_class <- factor(
+  levels(traindata2$病理分型)[apply(predtrain_rsvm[, 1:3], 1, which.max)]
+)
+predtrain_rsvm <- predtrain_rsvm %>%
+  bind_cols(traindata2 %>% select(病理分型)) %>%
+  mutate(dataset = "train")
+
+# 评估模型ROC曲线-训练集上
+roctrain_rsvm <- predtrain_rsvm %>%
+  roc_curve(病理分型, 1:3) %>%
+  mutate(dataset = "train")
+autoplot(roctrain_rsvm)
+
+# 混淆矩阵
+cmtrain_rsvm <- predtrain_rsvm %>%
+  conf_mat(truth = 病理分型, estimate = .pred_class)
+cmtrain_rsvm
+autoplot(cmtrain_rsvm, type = "heatmap") +
+  scale_fill_gradient(low = "white", high = "skyblue") +
+  labs(title = "confusionmatrix of svm for traindata") +
+  theme(text = element_text(size = 15))
+# 合并指标
+eval_train_rsvm <- cmtrain_rsvm %>%
+  summary() %>%
+  bind_rows(predtrain_rsvm %>%
+              roc_auc(病理分型, 1:3)) %>%
+  mutate(dataset = "train")
+eval_train_rsvm
+
+#################################################################
+
+# 应用模型-预测测试集
+predtest_rsvm <- final_rsvm %>%
+  predict(new_data = testdata2, type = "prob")
+predtest_rsvm$.pred_class <- factor(
+  levels(traindata2$病理分型)[apply(predtest_rsvm[, 1:3], 1, which.max)]
+)
+predtest_rsvm <- predtest_rsvm %>%
+  bind_cols(testdata2 %>% select(病理分型)) %>%
+  mutate(dataset = "test") %>%
+  mutate(model = "rsvm")
+
+
+# 评估模型ROC曲线-测试集上
+roctest_rsvm <- predtest_rsvm %>%
+  roc_curve(病理分型, 1:3) %>%
+  mutate(dataset = "test")
+autoplot(roctest_rsvm)
+
+
+# 混淆矩阵
+cmtest_rsvm <- predtest_rsvm %>%
+  conf_mat(truth = 病理分型, estimate = .pred_class)
+cmtest_rsvm
+autoplot(cmtest_rsvm, type = "heatmap") +
+  scale_fill_gradient(low = "white", high = "skyblue") +
+  labs(title = "confusionmatrix of svm for testdata") +
+  theme(text = element_text(size = 15))
+# 合并指标
+eval_test_rsvm <- cmtest_rsvm %>%
+  summary() %>%
+  bind_rows(predtest_rsvm %>%
+              roc_auc(病理分型, 1:3)) %>%
+  mutate(dataset = "test")
+eval_test_rsvm
+
+#################################################################
+
+# 合并训练集和测试集上ROC曲线
+roctrain_rsvm %>%
+  bind_rows(roctest_rsvm) %>%
+  mutate(dataset = factor(dataset, levels = c("train", "test"))) %>%
+  ggplot(aes(x = 1-specificity, y = sensitivity, color = dataset)) +
+  geom_path(size = 1) +
+  geom_abline(intercept = 0, slope = 1) +
+  facet_wrap(~.level) +
+  labs(title = "ROC of svm") +
+  theme_bw()
+
+# 合并训练集和测试集上性能指标
+eval_rsvm <- eval_train_rsvm %>%
+  bind_rows(eval_test_rsvm) %>%
+  mutate(model = "rsvm")
+eval_rsvm
+
+#################################################################
+#################################################################
+#################################################################
+
+set.seed(1227)
+finalwk_lasso <- wk_lasso %>%
+  finalize_workflow(hpbest_lasso) %>%
+  fit_resamples(folds, control = control_stack_grid())
+finalwk_lasso
+set.seed(1227)
+finalwk_rf <- wk_rf %>%
+  finalize_workflow(hpbest_rf) %>%
+  fit_resamples(folds, control = control_stack_grid())
+finalwk_rf
+set.seed(1227)
+finalwk_xgboost <- wk_xgboost %>%
+  finalize_workflow(hpbest_xgboost) %>%
+  fit_resamples(folds, control = control_stack_grid())
+finalwk_xgboost
+finalwk_rsvm <- wk_rsvm %>%
+  finalize_workflow(hpbest_rsvm) %>%
+  fit_resamples(folds, control = control_stack_grid())
+finalwk_rsvm
+
+wkset4 <-
+  as_workflow_set("lasso" = finalwk_lasso,
+                  "rf" = finalwk_rf,
+                  "xgboost" = finalwk_xgboost,
+                  "svm" = finalwk_rsvm)
+final_stack <-
+  stacks() %>%
+  add_candidates(wkset4) %>%
+  blend_predictions() %>%
+  fit_members()
+final_stack
+
+#################################################################
+
+# 应用模型-预测所有样本
+predall_stack <- final_stack %>%
+  predict(new_data = alldata2, type = "prob") %>%
+  bind_cols(final_stack %>%
+              predict(new_data = alldata2, type = "class")) %>%
+  bind_cols(alldata) %>%
+  mutate(model = "stack")
+
+#################################################################
+
+# 应用模型-预测训练集
+predtrain_stack <- final_stack %>%
+  predict(new_data = traindata2, type = "prob") %>%
+  bind_cols(final_stack %>%
+              predict(new_data = traindata2, type = "class")) %>%
+  bind_cols(traindata2 %>% select(病理分型)) %>%
+  mutate(dataset = "train")
+
+# 评估模型ROC曲线-训练集上
+roctrain_stack <- predtrain_stack %>%
+  roc_curve(病理分型, 1:3) %>%
+  mutate(dataset = "train")
+autoplot(roctrain_stack)
+
+# 混淆矩阵
+cmtrain_stack <- predtrain_stack %>%
+  conf_mat(truth = 病理分型, estimate = .pred_class)
+cmtrain_stack
+autoplot(cmtrain_stack, type = "heatmap") +
+  scale_fill_gradient(low = "white", high = "skyblue") +
+  labs(title = "confusionmatrix of stack for traindata") +
+  theme(text = element_text(size = 15))
+# 合并指标
+eval_train_stack <- cmtrain_stack %>%
+  summary() %>%
+  bind_rows(predtrain_stack %>%
+              roc_auc(病理分型, 1:3)) %>%
+  mutate(dataset = "train")
+eval_train_stack
+#################################################################
+
+# 应用模型-预测测试集
+predtest_stack <- final_stack %>%
+  predict(new_data = testdata2, type = "prob") %>%
+  bind_cols(final_stack %>%
+              predict(new_data = testdata2, type = "class")) %>%
+  bind_cols(testdata2 %>% select(病理分型)) %>%
+  mutate(dataset = "test") %>%
+  mutate(model = "stack")
+
+# 评估模型ROC曲线-测试集上
+roctest_stack <- predtest_stack %>%
+  roc_curve(病理分型, 1:3) %>%
+  mutate(dataset = "test")
+autoplot(roctest_stack)
+
+
+# 混淆矩阵
+cmtest_stack <- predtest_stack %>%
+  conf_mat(truth = 病理分型, estimate = .pred_class)
+cmtest_stack
+autoplot(cmtest_stack, type = "heatmap") +
+  scale_fill_gradient(low = "white", high = "skyblue") +
+  labs(title = "confusionmatrix of stack for testdata") +
+  theme(text = element_text(size = 15))
+# 合并指标
+eval_test_stack <- cmtest_stack %>%
+  summary() %>%
+  bind_rows(predtest_stack %>%
+              roc_auc(病理分型, 1:3)) %>%
+  mutate(dataset = "test")
+eval_test_stack
+#################################################################
+
+# 合并训练集和测试集上ROC曲线
+roctrain_stack %>%
+  bind_rows(roctest_stack) %>%
+  mutate(dataset = factor(dataset, levels = c("train", "test"))) %>%
+  ggplot(aes(x = 1-specificity, y = sensitivity, color = dataset)) +
+  geom_path(size = 1) +
+  geom_abline(intercept = 0, slope = 1) +
+  facet_wrap(~.level) +
+  labs(title = "ROC of stack") +
+  theme_bw()
+
+
+# 合并训练集和测试集上性能指标
+eval_stack <- eval_train_stack %>%
+  bind_rows(eval_test_stack) %>%
+  mutate(model = "stack")
+eval_stack
+
+#################################################################
+#################################################################
+#################################################################
+
+# 合并结果
+eval5 <- bind_rows(eval_lasso, eval_rf, eval_xgboost, eval_rsvm,
+                   eval_stack) %>%
+  select(-.estimator) %>%
+  pivot_wider(names_from = .metric, values_from = .estimate)
+eval5
+write.csv(eval5, "5模型在训练集测试集上的评估结果.csv")
+
+predall <- bind_rows(predall_lasso, predall_rf, predall_xgboost,
+                     predall_rsvm, predall_stack) %>%
+  pivot_wider(names_from = model, values_from = 1:4)
+write.csv(predall, "5模型在所有样本上的预测结果.csv")
